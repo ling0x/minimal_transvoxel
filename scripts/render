@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""Renders a Wavefront OBJ to a PNG — the tool that produced README's terrain.png.
+
+A z-buffered software rasteriser: flat shading from the triangle normals, colour
+by height, perspective camera. Every object in the file is drawn with identical
+settings, so the blocky and smooth terrains can be compared like for like.
+
+This is a development tool, not part of the crate. It is the only thing here that
+is not std-only Rust; it needs numpy and Pillow.
+
+    cargo run --example terrain_obj > terrain.obj
+    scripts/render terrain.obj terrain.png
+"""
+
+import sys
+
+import numpy as np
+from PIL import Image
+
+W, H = 1500, 620
+SS = 3                          # supersampling, downsampled at the end
+FOV_Y = np.radians(32.0)
+
+# Framed for the two 10x10 chunks the terrain example writes, 13 apart in x.
+EYE = np.array([8.0, 13.5, 25.0])
+TARGET = np.array([11.5, 2.6, 5.0])
+
+KEY = np.array([0.45, 0.80, 0.42]); KEY /= np.linalg.norm(KEY)
+FILL = np.array([-0.55, 0.25, -0.35]); FILL /= np.linalg.norm(FILL)
+AMBIENT, KEY_I, FILL_I = 0.34, 0.78, 0.20
+
+SKY_TOP, SKY_BOTTOM = (0x1a, 0x1f, 0x2b), (0x38, 0x40, 0x4f)
+
+# Height -> base colour: soil, earth, grass, scrub, rock, snow.
+RAMP = [(0.0, (0x5b, 0x47, 0x36)),
+        (1.6, (0x6f, 0x58, 0x3c)),
+        (3.0, (0x5c, 0x7c, 0x40)),
+        (5.0, (0x82, 0x8f, 0x4a)),
+        (6.8, (0x93, 0x92, 0x88)),
+        (8.0, (0xd8, 0xdc, 0xdf))]
+LUT_N, LUT_MAX = 512, 8.0
+
+
+def build_lut():
+    """The height ramp sampled into a table, so it can be applied per pixel.
+
+    Colouring per triangle instead splits every tall quad down its diagonal: its
+    two halves have centroids at different heights, so they take different
+    colours and the seam shows.
+    """
+    ys = np.linspace(0.0, LUT_MAX, LUT_N)
+    xs = np.array([stop[0] for stop in RAMP])
+    cs = np.array([stop[1] for stop in RAMP], float)
+    return np.stack([np.interp(ys, xs, cs[:, k]) for k in range(3)], axis=1)
+
+
+LUT = build_lut()
+
+
+def load(path):
+    """Vertices, and the triangles of each `o` group. Ignores everything else."""
+    verts, groups, current = [], {}, None
+    for line in open(path):
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "o":
+            current = parts[1]
+            groups[current] = []
+        elif parts[0] == "v":
+            verts.append([float(v) for v in parts[1:4]])
+        elif parts[0] == "f":
+            # Tolerate v/vt/vn faces, though the examples emit bare indices.
+            groups[current].append([int(i.split("/")[0]) - 1 for i in parts[1:4]])
+    return np.array(verts), groups
+
+
+def render(verts, tris):
+    rw, rh = W * SS, H * SS
+
+    forward = TARGET - EYE; forward /= np.linalg.norm(forward)
+    right = np.cross(forward, [0, 1, 0]); right /= np.linalg.norm(right)
+    up = np.cross(right, forward)
+    focal = (rh / 2) / np.tan(FOV_Y / 2)
+
+    rel = verts - EYE
+    view = np.stack([rel @ right, rel @ up, rel @ forward], axis=1)
+    depth = np.maximum(view[:, 2], 1e-6)
+    sx = rw / 2 + view[:, 0] / depth * focal
+    sy = rh / 2 - view[:, 1] / depth * focal
+
+    # Background: a soft vertical gradient.
+    img = np.empty((rh, rw, 3), np.float32)
+    t = np.linspace(0, 1, rh)[:, None]
+    img[:] = ((1 - t) * np.array(SKY_TOP) + t * np.array(SKY_BOTTOM))[:, None, :]
+    zbuf = np.full((rh, rw), -np.inf, np.float32)
+
+    a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
+    normals = np.cross(verts[b] - verts[a], verts[c] - verts[a])
+    lengths = np.linalg.norm(normals, axis=1)
+    centroids = (verts[a] + verts[b] + verts[c]) / 3.0
+
+    # Backface cull: the meshes are closed and wound outwards, so a visible face
+    # is one whose normal leans towards the eye.
+    facing = np.einsum("ij,ij->i", normals, centroids - EYE)
+    visible = (lengths > 1e-9) & (facing < 0)
+    print(f"{visible.sum()} of {len(tris)} triangles front-facing")
+
+    drawn = 0
+    for i in np.flatnonzero(visible):
+        n = normals[i] / lengths[i]
+        shade = (AMBIENT
+                 + KEY_I * max(0.0, float(n @ KEY))
+                 + FILL_I * max(0.0, float(n @ FILL)))
+
+        idx = tris[i]
+        x0, x1, x2 = sx[idx]
+        y0, y1, y2 = sy[idx]
+        iz = 1.0 / depth[idx]
+        # World height over z, so it interpolates perspective-correctly below.
+        hz = verts[idx][:, 1] * iz
+
+        lo_x = max(0, int(np.floor(min(x0, x1, x2))))
+        hi_x = min(rw - 1, int(np.ceil(max(x0, x1, x2))))
+        lo_y = max(0, int(np.floor(min(y0, y1, y2))))
+        hi_y = min(rh - 1, int(np.ceil(max(y0, y1, y2))))
+        if lo_x > hi_x or lo_y > hi_y:
+            continue
+
+        # Twice the signed screen area: the barycentric denominator.
+        den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2)
+        if abs(den) < 1e-12:
+            continue
+
+        X, Y = np.meshgrid(np.arange(lo_x, hi_x + 1), np.arange(lo_y, hi_y + 1))
+        l0 = ((y1 - y2) * (X - x2) + (x2 - x1) * (Y - y2)) / den
+        l1 = ((y2 - y0) * (X - x2) + (x0 - x2) * (Y - y2)) / den
+        l2 = 1.0 - l0 - l1
+        inside = (l0 >= 0) & (l1 >= 0) & (l2 >= 0)
+        if not inside.any():
+            continue
+
+        # 1/z is what interpolates linearly in screen space; larger is nearer.
+        invz = l0 * iz[0] + l1 * iz[1] + l2 * iz[2]
+        tile = (slice(lo_y, hi_y + 1), slice(lo_x, hi_x + 1))
+        win = inside & (invz > zbuf[tile])
+        if not win.any():
+            continue
+
+        zbuf[tile][win] = invz[win]
+        height = (l0 * hz[0] + l1 * hz[1] + l2 * hz[2])[win] / invz[win]
+        slot = np.clip((height / LUT_MAX * (LUT_N - 1)).astype(int), 0, LUT_N - 1)
+        img[tile][win] = np.clip(LUT[slot] * shade, 0, 255)
+        drawn += 1
+
+    print(f"{drawn} triangles contributed pixels")
+    return Image.fromarray(img.astype(np.uint8)).resize((W, H), Image.LANCZOS)
+
+
+def main():
+    obj = sys.argv[1] if len(sys.argv) > 1 else "terrain.obj"
+    out = sys.argv[2] if len(sys.argv) > 2 else "terrain.png"
+
+    verts, groups = load(obj)
+    tris = np.array([f for group in groups.values() for f in group])
+    print(f"{obj}: {len(verts)} vertices, {len(tris)} triangles in {list(groups)}")
+
+    render(verts, tris).save(out)
+    print(f"wrote {out} ({W}x{H})")
+
+
+if __name__ == "__main__":
+    main()
